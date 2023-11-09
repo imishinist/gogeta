@@ -7,4 +7,5 @@ gogeta:
 
 .PHONY: clean
 clean:
-	rm gogeta
+	rm -f gogeta
+	rm -f cpu.pprof

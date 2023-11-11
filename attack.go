@@ -4,12 +4,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/xo/dburl"
+
+	gogeta "github.com/imishinist/gogeta/lib"
 )
 
 func attackCmd() command {
@@ -70,8 +75,16 @@ func attack(opts *attackOpts) error {
 
 	wg := new(sync.WaitGroup)
 	tick := make(chan struct{})
-	taskCh := make(chan struct{})
-	errCh := make(chan error)
+	taskCh := make(chan *gogeta.Request)
+	resultCh := make(chan *gogeta.Response)
+	sigCh := make(chan os.Signal, 1)
+	stopCh := make(chan struct{})
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		<-sigCh
+		close(stopCh)
+	}()
 
 	wg.Add(1)
 	go func() {
@@ -81,7 +94,13 @@ func attack(opts *attackOpts) error {
 		sleepDur := time.Duration(time.Second.Nanoseconds() / int64(opts.throughput))
 		start := time.Now()
 		for time.Since(start) < opts.duration {
-			tick <- struct{}{}
+			select {
+			case tick <- struct{}{}:
+			case <-stopCh:
+				fmt.Println("stopping...")
+				return
+			}
+
 			time.Sleep(sleepDur)
 		}
 	}()
@@ -92,7 +111,10 @@ func attack(opts *attackOpts) error {
 		defer wg.Done()
 
 		for range tick {
-			taskCh <- struct{}{}
+			taskCh <- &gogeta.Request{
+				Name:  opts.name,
+				Query: "SELECT 1",
+			}
 		}
 	}()
 
@@ -103,10 +125,17 @@ func attack(opts *attackOpts) error {
 			defer wg.Done()
 			log.Printf("[worker:%d] start", i)
 
-			for range taskCh {
-				_, err := conn.Exec("SELECT 1")
+			for task := range taskCh {
+				_, err := conn.Exec(task.Query)
 				if err != nil {
-					errCh <- err
+					resultCh <- &gogeta.Response{
+						Name:  task.Name,
+						Error: err,
+					}
+					continue
+				}
+				resultCh <- &gogeta.Response{
+					Name: task.Name,
 				}
 			}
 			log.Printf("[worker:%d] done", i)
@@ -115,11 +144,14 @@ func attack(opts *attackOpts) error {
 
 	go func() {
 		wg.Wait()
-		close(errCh)
+		close(resultCh)
 	}()
 
-	for err := range errCh {
-		fmt.Println(err)
+	for res := range resultCh {
+		if res.Error != nil {
+			fmt.Println(err)
+			continue
+		}
 	}
 
 	return nil

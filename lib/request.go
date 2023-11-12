@@ -14,4 +14,6 @@ type Request struct {
 	QueryType QueryType
 	Query     string `json:"Query,omitempty"`
 	ExecQuery string `json:"ExecQuery,omitempty"`
+
+	Prepare bool
 }

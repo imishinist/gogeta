@@ -27,6 +27,7 @@ func attackCmd() command {
 	fs.StringVar(&opts.name, "name", "", "Attack name")
 	fs.StringVar(&opts.query, "query", "SELECT 1", "Query to run")
 	fs.StringVar(&opts.execQuery, "exec-query", "", "Query to execute(no result)")
+	fs.BoolVar(&opts.prepare, "prepare", false, "use prepared statement")
 
 	fs.IntVar(&opts.workers, "workers", runtime.NumCPU()*2, "initial worker num")
 	fs.IntVar(&opts.maxWorkers, "max-workers", runtime.NumCPU()*10, "max worker num")
@@ -57,6 +58,7 @@ type attackOpts struct {
 
 	query     string
 	execQuery string
+	prepare   bool
 
 	workers    int
 	maxWorkers int
@@ -126,7 +128,8 @@ func attack(opts *attackOpts) error {
 
 		for range tick {
 			req := &gogeta.Request{
-				Name: opts.name,
+				Name:    opts.name,
+				Prepare: opts.prepare,
 			}
 			if opts.execQuery != "" {
 				req.QueryType = gogeta.Execute
@@ -149,19 +152,37 @@ func attack(opts *attackOpts) error {
 			for task := range taskCh {
 				t1 := time.Now()
 				res := &gogeta.Response{
-					Name: task.Name,
+					Name:     task.Name,
+					Prepared: task.Prepare,
 				}
 				switch task.QueryType {
 				case gogeta.Query:
 					res.QueryType = gogeta.Query
 					res.Query = task.Query
 
-					qres, err := conn.QueryContext(ctx, task.Query)
-					if err != nil {
-						res.Error = err
-						resultCh <- res
-						continue
+					var qres *sql.Rows
+					if task.Prepare {
+						stmt, err := conn.PrepareContext(ctx, task.Query)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
+						qres, err = stmt.QueryContext(ctx)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
+					} else {
+						qres, err = conn.QueryContext(ctx, task.Query)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
 					}
+
 					var (
 						results []map[string]interface{}
 					)
@@ -174,11 +195,27 @@ func attack(opts *attackOpts) error {
 					res.QueryType = gogeta.Execute
 					res.ExecQuery = task.ExecQuery
 
-					qres, err := conn.ExecContext(ctx, task.ExecQuery)
-					if err != nil {
-						res.Error = err
-						resultCh <- res
-						continue
+					var qres sql.Result
+					if task.Prepare {
+						stmt, err := conn.PrepareContext(ctx, task.ExecQuery)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
+						qres, err = stmt.ExecContext(ctx)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
+					} else {
+						qres, err = conn.ExecContext(ctx, task.ExecQuery)
+						if err != nil {
+							res.Error = err
+							resultCh <- res
+							continue
+						}
 					}
 					res.LastInsertId, _ = qres.LastInsertId()
 					res.RowsAffected, _ = qres.RowsAffected()

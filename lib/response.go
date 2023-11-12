@@ -7,6 +7,7 @@ type Response struct {
 	QueryType QueryType
 	Query     string `json:"Query,omitempty"`
 	ExecQuery string `json:"ExecQuery,omitempty"`
+	Prepared  bool
 
 	LastInsertId int64
 	RowsAffected int64

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -22,6 +25,9 @@ func attackCmd() command {
 	opts := &attackOpts{}
 
 	fs.StringVar(&opts.name, "name", "", "Attack name")
+	fs.StringVar(&opts.query, "query", "SELECT 1", "Query to run")
+	fs.StringVar(&opts.execQuery, "exec-query", "", "Query to execute(no result)")
+
 	fs.IntVar(&opts.workers, "workers", runtime.NumCPU()*2, "initial worker num")
 	fs.IntVar(&opts.maxWorkers, "max-workers", runtime.NumCPU()*10, "max worker num")
 
@@ -47,7 +53,11 @@ func attackCmd() command {
 }
 
 type attackOpts struct {
-	name       string
+	name string
+
+	query     string
+	execQuery string
+
 	workers    int
 	maxWorkers int
 
@@ -73,6 +83,9 @@ func attack(opts *attackOpts) error {
 	conn.SetConnMaxLifetime(opts.connMaxLifetime)
 	conn.SetConnMaxIdleTime(opts.connMaxIdleTime)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	wg := new(sync.WaitGroup)
 	tick := make(chan struct{})
 	taskCh := make(chan *gogeta.Request)
@@ -83,6 +96,7 @@ func attack(opts *attackOpts) error {
 
 	go func() {
 		<-sigCh
+		cancel()
 		close(stopCh)
 	}()
 
@@ -111,10 +125,17 @@ func attack(opts *attackOpts) error {
 		defer wg.Done()
 
 		for range tick {
-			taskCh <- &gogeta.Request{
-				Name:  opts.name,
-				Query: "SELECT 1",
+			req := &gogeta.Request{
+				Name: opts.name,
 			}
+			if opts.execQuery != "" {
+				req.QueryType = gogeta.Execute
+				req.Query = opts.execQuery
+			} else if opts.query != "" {
+				req.QueryType = gogeta.Query
+				req.Query = opts.query
+			}
+			taskCh <- req
 		}
 	}()
 
@@ -126,16 +147,45 @@ func attack(opts *attackOpts) error {
 			log.Printf("[worker:%d] start", i)
 
 			for task := range taskCh {
-				_, err := conn.Exec(task.Query)
-				if err != nil {
-					resultCh <- &gogeta.Response{
-						Name:  task.Name,
-						Error: err,
-					}
-					continue
-				}
-				resultCh <- &gogeta.Response{
+				t1 := time.Now()
+				res := &gogeta.Response{
 					Name: task.Name,
+				}
+				switch task.QueryType {
+				case gogeta.Query:
+					res.QueryType = gogeta.Query
+					res.Query = task.Query
+
+					qres, err := conn.QueryContext(ctx, task.Query)
+					if err != nil {
+						res.Error = err
+						resultCh <- res
+						continue
+					}
+					var (
+						results []map[string]interface{}
+					)
+					results, res.Error = scanResults(qres)
+					res.ResultCount = len(results)
+					res.Latency = time.Since(t1).Microseconds()
+					qres.Close()
+					resultCh <- res
+				case gogeta.Execute:
+					res.QueryType = gogeta.Execute
+					res.ExecQuery = task.ExecQuery
+
+					qres, err := conn.ExecContext(ctx, task.ExecQuery)
+					if err != nil {
+						res.Error = err
+						resultCh <- res
+						continue
+					}
+					res.LastInsertId, _ = qres.LastInsertId()
+					res.RowsAffected, _ = qres.RowsAffected()
+					res.Latency = time.Since(t1).Microseconds()
+					resultCh <- res
+				default:
+					// just ignore
 				}
 			}
 			log.Printf("[worker:%d] done", i)
@@ -147,12 +197,39 @@ func attack(opts *attackOpts) error {
 		close(resultCh)
 	}()
 
+	enc := json.NewEncoder(os.Stdout)
 	for res := range resultCh {
 		if res.Error != nil {
-			fmt.Println(err)
+			log.Println(err)
 			continue
 		}
+		_ = enc.Encode(res)
 	}
 
 	return nil
+}
+
+func scanResults(rows *sql.Rows) ([]map[string]interface{}, error) {
+	res := make([]map[string]interface{}, 0)
+	cols, _ := rows.Columns()
+	for rows.Next() {
+		columns := make([]interface{}, len(cols))
+		columnPointers := make([]interface{}, len(cols))
+		for i, _ := range columns {
+			columnPointers[i] = &columns[i]
+		}
+
+		if err := rows.Scan(columnPointers...); err != nil {
+			return nil, err
+		}
+
+		m := make(map[string]interface{})
+		for i, colName := range cols {
+			val := columnPointers[i].(*interface{})
+			m[colName] = *val
+		}
+
+		res = append(res, m)
+	}
+	return res, nil
 }
